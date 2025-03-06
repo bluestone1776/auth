@@ -1,0 +1,232 @@
+import 'package:firebase_auth/firebase_auth.dart' hide EmailAuthProvider;
+import 'package:firebase_ui_auth/firebase_ui_auth.dart';
+import 'package:firebase_ui_oauth_google/firebase_ui_oauth_google.dart';
+import 'package:firebase_ui_oauth_apple/firebase_ui_oauth_apple.dart';
+import 'package:flutter/material.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+
+// Import your custom Sign In/Sign Up widget.
+import 'sign_in_sign_up.dart';
+// Import the helper function for Google client ID.
+import 'platform_helper.dart' show getGoogleClientId;
+
+// Import the unified map screen.
+import '../map.dart'; // Ensure this path is correct for your project
+
+class AuthGate extends StatefulWidget {
+  const AuthGate({super.key});
+
+  @override
+  _AuthGateState createState() => _AuthGateState();
+}
+
+class _AuthGateState extends State<AuthGate> {
+  @override
+  Widget build(BuildContext context) {
+    return StreamBuilder<User?>(
+      stream: FirebaseAuth.instance.authStateChanges(),
+      builder: (context, snapshot) {
+        // While waiting for authentication state, show a loading indicator.
+        if (snapshot.connectionState == ConnectionState.waiting) {
+          return const Scaffold(
+            body: Center(child: CircularProgressIndicator()),
+          );
+        }
+
+        // If the user is not signed in, display the sign-in screen.
+        if (!snapshot.hasData) {
+          return Scaffold(
+            backgroundColor: Colors.white,
+            body: Container(
+              decoration: BoxDecoration(
+                gradient: RadialGradient(
+                  center: Alignment.center,
+                  radius: 1.5,
+                  colors: [
+                    const Color.fromARGB(255, 30, 226, 233).withOpacity(0.3),
+                    Colors.white,
+                    Colors.white,
+                    Colors.blue.withOpacity(0.3),
+                  ],
+                  stops: const [0.0, 0.4, 0.6, 1.0],
+                ),
+              ),
+              child: Center(
+                child: Padding(
+                  padding: const EdgeInsets.all(16.0),
+                  child: SignInScreen(
+                    providers: [
+                      GoogleProvider(
+                        clientId: getGoogleClientId(),
+                      ),
+                      AppleProvider(),
+                    ],
+                    actions: [
+                      AuthStateChangeAction<SignedIn>(
+                        (context, state) async {
+                          await _setupUserProfile(state.user);
+                          Navigator.of(context).pushReplacement(
+                            MaterialPageRoute(
+                              builder: (context) => const MapScreen(),
+                            ),
+                          );
+                        },
+                      ),
+                    ],
+                    subtitleBuilder: (context, action) =>
+                        const SizedBox.shrink(),
+                    footerBuilder: (context, action) {
+                      return Padding(
+                        padding: const EdgeInsets.only(top: 16),
+                        child: GestureDetector(
+                          onTap: () {
+                            Navigator.push(
+                              context,
+                              MaterialPageRoute(
+                                builder: (_) => const TermsOfServicePage(),
+                              ),
+                            );
+                          },
+                          child: const Text(
+                            'By signing in, you agree to our Terms and Conditions.',
+                            style: TextStyle(
+                              color: Colors.grey,
+                              decoration: TextDecoration.none,
+                            ),
+                            textAlign: TextAlign.center,
+                          ),
+                        ),
+                      );
+                    },
+                    showAuthActionSwitch: false,
+                  ),
+                ),
+              ),
+            ),
+          );
+        }
+
+        // If the user is already signed in, navigate directly to the map screen.
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          Navigator.of(context).pushReplacement(
+            MaterialPageRoute(builder: (context) => const MapScreen()),
+          );
+        });
+
+        return const Scaffold(
+          body: Center(child: CircularProgressIndicator()),
+        );
+      },
+    );
+  }
+
+  Future<void> _setupUserProfile(User? user) async {
+    if (user != null) {
+      DocumentReference userRef =
+          FirebaseFirestore.instance.collection('users').doc(user.uid);
+      DocumentSnapshot userSnapshot = await userRef.get();
+
+      bool isNewUser = !userSnapshot.exists;
+      if (isNewUser) {
+        int newCount = await _incrementUserCountAndGet();
+        Map<String, dynamic> userData = {};
+        String email = user.email ?? '';
+        userData['email'] = email;
+
+        // Generate a username based on email or private relay status.
+        bool isPrivateRelay = email.contains('privaterelay.appleid.com');
+
+        if (isPrivateRelay) {
+          String newName = 'AppUser${10000 + newCount}';
+          await user.updateDisplayName(newName);
+          userData['username'] = newName;
+        } else if (user.displayName == null || user.displayName!.isEmpty) {
+          String username = email.split('@')[0];
+          await user.updateDisplayName(username);
+          userData['username'] = username;
+        } else {
+          userData['username'] = user.displayName!;
+        }
+
+        // Do not assign a default profile image.
+        if (user.photoURL != null && user.photoURL!.isNotEmpty) {
+          userData['photoURL'] = user.photoURL!;
+        }
+
+        await userRef.set(userData, SetOptions(merge: true));
+      } else {
+        final currentData = userSnapshot.data() as Map<String, dynamic>? ?? {};
+        String email = user.email ?? '';
+
+        if ((user.displayName == null || user.displayName!.isEmpty) &&
+            (!currentData.containsKey('username') ||
+                currentData['username'].toString().isEmpty)) {
+          bool isPrivateRelay = email.contains('privaterelay.appleid.com');
+          if (isPrivateRelay) {
+            int newCount = await _incrementUserCountAndGet();
+            String newName = 'AppUser${10000 + newCount}';
+            await user.updateDisplayName(newName);
+            await userRef.set({'username': newName}, SetOptions(merge: true));
+          } else {
+            final fallbackUsername = email.split('@')[0];
+            await user.updateDisplayName(fallbackUsername);
+            await userRef
+                .set({'username': fallbackUsername}, SetOptions(merge: true));
+          }
+        }
+
+        // Do not assign a default profile image.
+        if (user.photoURL != null && user.photoURL!.isNotEmpty) {
+          await userRef.set({'photoURL': user.photoURL!}, SetOptions(merge: true));
+        }
+      }
+    }
+  }
+
+  Future<int> _incrementUserCountAndGet() async {
+    DocumentReference counterRef =
+        FirebaseFirestore.instance.collection('counters').doc('users');
+    DocumentSnapshot doc = await counterRef.get();
+
+    int currentCount = 0;
+    if (doc.exists) {
+      final data = doc.data() as Map<String, dynamic>?;
+      if (data != null && data.containsKey('count')) {
+        currentCount = data['count'];
+      }
+    }
+
+    final newCount = currentCount + 1;
+    await counterRef.set({'count': newCount}, SetOptions(merge: true));
+    return newCount;
+  }
+}
+
+class TermsOfServicePage extends StatelessWidget {
+  const TermsOfServicePage({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.white,
+      appBar: AppBar(
+        title: const Text('Terms of Service'),
+        backgroundColor: Colors.blueAccent,
+      ),
+      body: SingleChildScrollView(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: const [
+            Text(
+              "By using this app, you agree to the Terms of Service.",
+              style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
+            ),
+            SizedBox(height: 20),
+            // Additional universal terms content can be added here...
+          ],
+        ),
+      ),
+    );
+  }
+}
